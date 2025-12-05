@@ -31,33 +31,95 @@ export function CartProvider({
 }) {
   const [cart, setCart] = useState<CartItem[]>([])
   const isInitialized = useRef(false)
+  const isSyncingToRemote = useRef(false)
 
   const getStorageKey = (uid: string | number | null) => {
     if (uid) return `cart_user_${uid}`
     return "cart_guest"
   }
 
-  // Load cart from localStorage when userId changes
+  // Load cart when userId changes: first from localStorage, then from Supabase for logged-in users
   useEffect(() => {
     isInitialized.current = false
-    try {
-      const key = getStorageKey(userId as any)
-      const stored = localStorage.getItem(key)
-      setCart(stored ? JSON.parse(stored) : [])
-    } catch {
-      setCart([])
-    } finally {
-      isInitialized.current = true
+
+    const load = async () => {
+      try {
+        const key = getStorageKey(userId as any)
+        const stored = typeof window !== "undefined" ? localStorage.getItem(key) : null
+        let initialCart: CartItem[] = stored ? JSON.parse(stored) : []
+
+        // If we have a logged-in user, try to load from Supabase via API to share cart across devices
+        if (userId) {
+          try {
+            const res = await fetch(`/api/cart?userEmail=${encodeURIComponent(String(userId))}`)
+            if (res.ok) {
+              const data = await res.json()
+              if (Array.isArray(data.items)) {
+                initialCart = data.items
+              }
+            }
+          } catch {
+            // ignore remote load errors, fallback to local
+          }
+        }
+
+        setCart(initialCart)
+      } catch {
+        setCart([])
+      } finally {
+        isInitialized.current = true
+      }
     }
+
+    load()
   }, [userId])
 
-  // Save cart to localStorage
+  // Save cart to localStorage and Supabase (for logged-in users)
   useEffect(() => {
     if (!isInitialized.current) return
+
+    const key = getStorageKey(userId as any)
+
+    // Always keep localStorage in sync (for guests and offline access)
     try {
-      const key = getStorageKey(userId as any)
-      localStorage.setItem(key, JSON.stringify(cart))
-    } catch {}
+      if (typeof window !== "undefined") {
+        localStorage.setItem(key, JSON.stringify(cart))
+      }
+    } catch {
+      // ignore
+    }
+
+    // For logged-in users, also sync to Supabase through the API
+    if (userId && !isSyncingToRemote.current) {
+      const controller = new AbortController()
+
+      const sync = async () => {
+        try {
+          isSyncingToRemote.current = true
+          await fetch("/api/cart", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              userEmail: String(userId),
+              items: cart,
+            }),
+            signal: controller.signal,
+          })
+        } catch {
+          // ignore sync errors, cart is still in localStorage
+        } finally {
+          isSyncingToRemote.current = false
+        }
+      }
+
+      sync()
+
+      return () => {
+        controller.abort()
+      }
+    }
   }, [cart, userId])
 
   const add = (item: CartItem) => {
